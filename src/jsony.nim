@@ -200,9 +200,72 @@ proc validRuneAt(s: string, i: int): Option[Rune] =
         ))
 
 proc parseUnicodeEscape(s: string, i: var int): int =
+  ## Parse a \uXXXX escape (and UTF-16 surrogate pair when present).
+  ## Fast path: inline hex digit decoding for the common valid case.
+  ## Falls back to parseHexInt for invalid hex or nimvm to preserve semantics.
+  template hex4(at: int, outv: untyped, ok: untyped) =
+    let c0 = s[at]
+    let c1 = s[at + 1]
+    let c2 = s[at + 2]
+    let c3 = s[at + 3]
+    let d0 = (if c0 >= '0' and c0 <= '9': ord(c0) - ord('0')
+              elif c0 >= 'a' and c0 <= 'f': ord(c0) - ord('a') + 10
+              elif c0 >= 'A' and c0 <= 'F': ord(c0) - ord('A') + 10
+              else: -1)
+    let d1 = (if c1 >= '0' and c1 <= '9': ord(c1) - ord('0')
+              elif c1 >= 'a' and c1 <= 'f': ord(c1) - ord('a') + 10
+              elif c1 >= 'A' and c1 <= 'F': ord(c1) - ord('A') + 10
+              else: -1)
+    let d2 = (if c2 >= '0' and c2 <= '9': ord(c2) - ord('0')
+              elif c2 >= 'a' and c2 <= 'f': ord(c2) - ord('a') + 10
+              elif c2 >= 'A' and c2 <= 'F': ord(c2) - ord('A') + 10
+              else: -1)
+    let d3 = (if c3 >= '0' and c3 <= '9': ord(c3) - ord('0')
+              elif c3 >= 'a' and c3 <= 'f': ord(c3) - ord('a') + 10
+              elif c3 >= 'A' and c3 <= 'F': ord(c3) - ord('A') + 10
+              else: -1)
+    ok = d0 >= 0 and d1 >= 0 and d2 >= 0 and d3 >= 0
+    if ok:
+      outv = (((d0 shl 12) or (d1 shl 8) or (d2 shl 4) or d3))
+
   inc i
   if i + 4 > s.len:
     error("Expected unicode escape hex but end reached.", i)
+  block parseHex:
+    var vhex = 0
+    var ok = false
+    when nimvm:
+      discard
+    else:
+      hex4(i, vhex, ok)
+    if ok:
+      result = vhex
+      i += 3
+      # Handle UTF-16 surrogates.
+      if (result and 0xfc00) == 0xd800:
+        inc i
+        if i >= s.len or s[i] != '\\':
+          error("Found an Orphan Surrogate.", i)
+        inc i
+        if i >= s.len or s[i] != 'u':
+          error("Found an Orphan Surrogate.", i)
+        inc i
+        if i + 4 > s.len:
+          error("Expected unicode escape hex but end reached.", i)
+        var nhex = 0
+        var nok = false
+        hex4(i, nhex, nok)
+        if nok:
+          i += 3
+          if (nhex and 0xfc00) == 0xdc00:
+            result = 0x10000 + (((result - 0xd800) shl 10) or (nhex - 0xdc00))
+          return
+        # Fallback for invalid hex in surrogate pair to preserve original behavior.
+        let nextRune = parseHexInt(s[i ..< i + 4])
+        i += 3
+        if (nextRune and 0xfc00) == 0xdc00:
+          result = 0x10000 + (((result - 0xd800) shl 10) or (nextRune - 0xdc00))
+      return
   result = parseHexInt(s[i ..< i + 4])
   i += 3
   # Deal with UTF-16 surrogates. Most of the time strings are encoded as utf8
