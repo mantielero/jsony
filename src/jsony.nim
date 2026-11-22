@@ -312,13 +312,117 @@ proc parseHook*(s: string, i: var int, v: var SomeSignedInt) =
 
 proc parseHook*(s: string, i: var int, v: var SomeFloat) =
   ## Will parse float32 and float64.
-  var f: float
-  eatSpace(s, i)
-  let chars = parseutils.parseFloat(s, f, i)
-  if chars == 0:
-    error("Failed to parse a float.", i)
-  i += chars
-  v = f
+  ## Fast path: scan decimal floats and compute with exact-small Clinger or
+  ## conservative Eisel-Lemire. Falls back to parseutils.parseFloat on any
+  ## ambiguity to preserve parsing/error semantics.
+  when nimvm:
+    var fVm: float
+    eatSpace(s, i)
+    let charsVm = parseutils.parseFloat(s, fVm, i)
+    if charsVm == 0:
+      error("Failed to parse a float.", i)
+    i += charsVm
+    v = fVm
+  else:
+    when not defined(jsonyNoFastFloat):
+      when defined(amd64) or defined(arm64):
+        block fastPath:
+          # Fast decimal scan + Eisel-Lemire/Clinger compute, strict fallback.
+          let n = s.len
+          var j = i
+          while j < n and (s[j] == ' ' or s[j] == '\n' or s[j] == '\t' or s[j] == '\r'):
+            inc j
+          var neg = false
+          if j < n and s[j] == '-':
+            neg = true
+            inc j
+          elif j < n and s[j] == '+':
+            break fastPath # Preserve original behavior.
+          var mant: uint64 = 0
+          var intDigits = 0
+          var totalDigits = 0
+          var sawDigit = false
+          var truncatedNonZero = false
+          while j < n and s[j] >= '0' and s[j] <= '9':
+            sawDigit = true
+            let d = uint64(ord(s[j]) - ord('0'))
+            if totalDigits < 19:
+              mant = mant * 10'u64 + d
+              inc totalDigits
+            else:
+              # >19 significant digits: cannot represent exact (w,q) safely.
+              if d != 0:
+                truncatedNonZero = true
+            inc intDigits
+            inc j
+          var fracDigits = 0
+          if j < n and s[j] == '.':
+            inc j
+            let fracStart = j
+            while j < n and s[j] >= '0' and s[j] <= '9':
+              sawDigit = true
+              let d = uint64(ord(s[j]) - ord('0'))
+              if totalDigits < 19:
+                mant = mant * 10'u64 + d
+                inc totalDigits
+              else:
+                if d != 0:
+                  truncatedNonZero = true
+              inc fracDigits
+              inc j
+            if j == fracStart:
+              break fastPath # "1." -> fallback.
+          if not sawDigit or (intDigits == 0 and fracDigits == 0):
+            break fastPath
+          var e10 = -fracDigits
+          if j < n and (s[j] == 'e' or s[j] == 'E'):
+            inc j
+            var eneg = false
+            if j < n and s[j] == '+':
+              inc j
+            elif j < n and s[j] == '-':
+              eneg = true
+              inc j
+            if j >= n or s[j] < '0' or s[j] > '9':
+              break fastPath # "1e" -> fallback.
+            var expVal = 0
+            while j < n and s[j] >= '0' and s[j] <= '9':
+              if expVal < 10000:
+                expVal = expVal * 10 + (ord(s[j]) - ord('0'))
+              inc j
+            e10 += (if eneg: -expVal else: expVal)
+          if truncatedNonZero:
+            break fastPath
+          var outv: float64
+          if mant == 0'u64:
+            outv = if neg: -0.0 else: 0.0
+            i = j
+            v = outv
+            return
+          # Exact small Clinger.
+          if mant <= (1'u64 shl 53) and e10 >= -22 and e10 <= 22:
+            outv = mant.float64
+            if e10 < 0:
+              outv = outv / fastnumMod.pow10f64[-e10]
+            elif e10 > 0:
+              outv = outv * fastnumMod.pow10f64[e10]
+            if neg: outv = -outv
+            i = j
+            v = outv
+            return
+          # Eisel-Lemire (conservative): unambiguous normal results only.
+          if e10 >= eiselMod.eiselSmallest and e10 <= eiselMod.eiselLargest:
+            if eiselMod.eiselCompute(mant, e10, neg, outv):
+              i = j
+              v = outv
+              return
+    var fOrig: float
+    eatSpace(s, i)
+    let charsOrig = parseutils.parseFloat(s, fOrig, i)
+    if charsOrig == 0:
+      error("Failed to parse a float.", i)
+    i += charsOrig
+    v = fOrig
 
 proc validRuneAt(s: string, i: int): Option[Rune] =
   # Based on fastRuneAt from std/unicode
