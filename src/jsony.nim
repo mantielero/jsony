@@ -1185,7 +1185,33 @@ proc parseHook*(s: string, i: var int, v: var JsonNode) =
       if i < s.len and s[i] == '}':
         break
       var k: string
-      parseHook(s, i, k)
+      block parseKeyStr:
+        when not defined(jsonyNoFastStr):
+          when not defined(js):
+            when nimvm:
+              discard
+            else:
+              # Fast path: plain ASCII key, no escapes/control chars.
+              var j = i
+              if j < s.len and s[j] == '"':
+                inc j
+                let start = j
+                while j < s.len:
+                  let ch = s[j]
+                  if ch == '"':
+                    let numBytes = j - start
+                    if numBytes > 0:
+                      k.setLen(numBytes)
+                      copyMem(k[0].addr, s[start].unsafeAddr, numBytes)
+                    else:
+                      k.setLen(0)
+                    i = j + 1
+                    break parseKeyStr
+                  let b = cast[uint8](ch)
+                  if ch == '\\' or b < 0x20'u8 or b >= 0x80'u8:
+                    break
+                  inc j
+        parseHook(s, i, k)
       eatChar(s, i, ':')
       var e: JsonNode
       parseHook(s, i, e)
@@ -1210,7 +1236,33 @@ proc parseHook*(s: string, i: var int, v: var JsonNode) =
     eatChar(s, i, ']')
   elif i < s.len and s[i] == '"':
     var str: string
-    parseHook(s, i, str)
+    block parseValStr:
+      when not defined(jsonyNoFastStr):
+        when not defined(js):
+          when nimvm:
+            discard
+          else:
+            # Fast path: plain ASCII string, no escapes/control chars.
+            var j = i
+            if j < s.len and s[j] == '"':
+              inc j
+              let start = j
+              while j < s.len:
+                let ch = s[j]
+                if ch == '"':
+                  let numBytes = j - start
+                  if numBytes > 0:
+                    str.setLen(numBytes)
+                    copyMem(str[0].addr, s[start].unsafeAddr, numBytes)
+                  else:
+                    str.setLen(0)
+                  i = j + 1
+                  break parseValStr
+                let b = cast[uint8](ch)
+                if ch == '\\' or b < 0x20'u8 or b >= 0x80'u8:
+                  break
+                inc j
+      parseHook(s, i, str)
     v = newJString(str)
   else:
     # Inline literal/number detection to avoid parseSymbol string allocation
