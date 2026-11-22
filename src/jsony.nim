@@ -1084,31 +1084,119 @@ proc parseHook*[T: object|ref object](s: string, i: var int, v: var T) =
       new(v)
   else:
     # Try looking for the discriminatorFieldName, then parse as normal object.
+    # Fast path: scan plain ASCII keys and compare discriminator slice directly,
+    # while preserving original error flow/comma handling on malformed input.
     eatSpace(s, i)
-    var saveI = i
-    while i < s.len:
-      var key: string
-      parseHook(s, i, key)
-      eatChar(s, i, ':')
-      when compiles(renameHook(v, key)):
-        renameHook(v, key)
-      if key == v.discriminatorFieldName:
-        var discriminator: type(v.discriminatorField)
-        parseHook(s, i, discriminator)
-        new(v, discriminator)
-        when compiles(newHook(v)):
-          newHook(v)
-        break
-      skipValue(s, i)
-      if i < s.len and s[i] != '}':
-        eatChar(s, i, ',')
-      else:
-        when compiles(newHook(v)):
-          newHook(v)
-        elif compiles(new(v)):
-          new(v)
-        break
-    i = saveI
+    let startI = i
+    block findDisc:
+      while i < s.len:
+        eatSpace(s, i)
+        block keyDone:
+          when not defined(jsonyNoFastKey):
+            block fastKey:
+              var j = i
+              if j >= s.len or s[j] != '"':
+                break fastKey
+              inc j
+              let keyStart = j
+              while j < s.len:
+                let ch = s[j]
+                if ch == '"':
+                  var kidx = j + 1
+                  while kidx < s.len and (s[kidx] == ' ' or s[kidx] == '\n' or s[kidx] == '\t' or s[kidx] == '\r'):
+                    inc kidx
+                  if kidx >= s.len or s[kidx] != ':':
+                    break fastKey
+                  inc kidx
+                  i = kidx
+                  let keyLen = j - keyStart
+                  when compiles(block:
+                    var tmpKey = ""
+                    renameHook(v, tmpKey)):
+                    var key = s[keyStart ..< j]
+                    renameHook(v, key)
+                    if key == v.discriminatorFieldName:
+                      var discriminator: type(v.discriminatorField)
+                      parseHook(s, i, discriminator)
+                      new(v, discriminator)
+                      when compiles(newHook(v)):
+                        newHook(v)
+                      break findDisc
+                  else:
+                    const disc = v.discriminatorFieldName
+                    if disc.len == keyLen:
+                      var same = true
+                      var p = 0
+                      while p < keyLen:
+                        if disc[p] != s[keyStart + p]:
+                          same = false
+                          break
+                        inc p
+                      if same:
+                        var discriminator: type(v.discriminatorField)
+                        parseHook(s, i, discriminator)
+                        new(v, discriminator)
+                        when compiles(newHook(v)):
+                          newHook(v)
+                        break findDisc
+                  # Not discriminator.
+                  skipValue(s, i)
+                  eatSpace(s, i)
+                  if i < s.len and s[i] == ',':
+                    inc i
+                    break keyDone
+                  elif i < s.len and s[i] == '}':
+                    when compiles(newHook(v)):
+                      newHook(v)
+                    elif compiles(new(v)):
+                      new(v)
+                    break findDisc
+                  elif i < s.len:
+                    eatChar(s, i, ',')
+                    break keyDone
+                  else:
+                    when compiles(newHook(v)):
+                      newHook(v)
+                    elif compiles(new(v)):
+                      new(v)
+                    break findDisc
+                let b = cast[uint8](ch)
+                if ch == '\\' or b < 0x20'u8 or b >= 0x80'u8:
+                  break fastKey
+                inc j
+              # Fall through to slow path.
+          # Slow path (also used when fast key not applicable, to preserve errors/behavior).
+          var key: string
+          parseHook(s, i, key)
+          eatChar(s, i, ':')
+          when compiles(renameHook(v, key)):
+            renameHook(v, key)
+          if key == v.discriminatorFieldName:
+            var discriminator: type(v.discriminatorField)
+            parseHook(s, i, discriminator)
+            new(v, discriminator)
+            when compiles(newHook(v)):
+              newHook(v)
+            break findDisc
+          skipValue(s, i)
+          eatSpace(s, i)
+          if i < s.len and s[i] == ',':
+            inc i
+          elif i < s.len and s[i] == '}':
+            when compiles(newHook(v)):
+              newHook(v)
+            elif compiles(new(v)):
+              new(v)
+            break findDisc
+          elif i < s.len:
+            eatChar(s, i, ',')
+          else:
+            when compiles(newHook(v)):
+              newHook(v)
+            elif compiles(new(v)):
+              new(v)
+            break findDisc
+    i = startI
   when v.isObjectVariant:
     # Object variant, check for duplicate discriminator field.
     # -d:release has different behavior.
