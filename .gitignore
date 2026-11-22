@@ -10,3 +10,5 @@ nimcache
 *.pdb
 *.ilk
 .*
+# Local performance artifacts (generated datasets, not tracked)
+/bench/data/
