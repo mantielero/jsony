@@ -1,5 +1,7 @@
 import jsony/objvar, std/json, std/options, std/parseutils, std/sets,
     std/strutils, std/tables, std/typetraits, std/unicode
+import ./jsony/fastnum as fastnumMod
+import ./jsony/floatparse as eiselMod
 
 type JsonError* = object of ValueError
 
@@ -853,6 +855,141 @@ proc parseHook*(s: string, i: var int, v: var JsonNode) =
     parseHook(s, i, str)
     v = newJString(str)
   else:
+    # Inline literal/number detection to avoid parseSymbol string allocation
+    # on common tokens. Falls back to original path on any ambiguity.
+    if i < s.len:
+      let c0 = s[i]
+      if c0 == 'n' and i + 3 < s.len and
+          s[i+1] == 'u' and s[i+2] == 'l' and s[i+3] == 'l':
+        let j = i + 4
+        if j >= s.len or s[j] in {',', '}', ']', ' ', '\n', '\t', '\r'}:
+          i = j
+          v = newJNull()
+          return
+      elif c0 == 't' and i + 3 < s.len and
+          s[i+1] == 'r' and s[i+2] == 'u' and s[i+3] == 'e':
+        let j = i + 4
+        if j >= s.len or s[j] in {',', '}', ']', ' ', '\n', '\t', '\r'}:
+          i = j
+          v = newJBool(true)
+          return
+      elif c0 == 'f' and i + 4 < s.len and
+          s[i+1] == 'a' and s[i+2] == 'l' and s[i+3] == 's' and s[i+4] == 'e':
+        let j = i + 5
+        if j >= s.len or s[j] in {',', '}', ']', ' ', '\n', '\t', '\r'}:
+          i = j
+          v = newJBool(false)
+          return
+      elif c0 in {'0'..'9', '-', '+'}:
+        var j = i
+        var neg = false
+        var hasDigits = false
+        var isFloatLike = false
+        var expMalformed = false
+        var mant: uint64 = 0
+        var totalDigits = 0
+        var fracDigits = 0
+        var truncatedNonZero = false
+        if s[j] == '-':
+          neg = true
+          inc j
+        elif s[j] == '+':
+          inc j
+        while j < s.len and s[j] >= '0' and s[j] <= '9':
+          hasDigits = true
+          let d = uint64(ord(s[j]) - ord('0'))
+          if totalDigits < 19:
+            mant = mant * 10'u64 + d
+            inc totalDigits
+          elif d != 0:
+            truncatedNonZero = true
+          inc j
+        if j < s.len and s[j] == '.':
+          isFloatLike = true
+          inc j
+          while j < s.len and s[j] >= '0' and s[j] <= '9':
+            hasDigits = true
+            let d = uint64(ord(s[j]) - ord('0'))
+            if totalDigits < 19:
+              mant = mant * 10'u64 + d
+              inc totalDigits
+            elif d != 0:
+              truncatedNonZero = true
+            inc fracDigits
+            inc j
+        var e10 = -fracDigits
+        if j < s.len and (s[j] == 'e' or s[j] == 'E'):
+          isFloatLike = true
+          inc j
+          var eneg = false
+          if j < s.len and s[j] == '+':
+            inc j
+          elif j < s.len and s[j] == '-':
+            eneg = true
+            inc j
+          let expStart = j
+          var expVal = 0
+          while j < s.len and s[j] >= '0' and s[j] <= '9':
+            if expVal < 10000:
+              expVal = expVal * 10 + (ord(s[j]) - ord('0'))
+            inc j
+          if j == expStart:
+            expMalformed = true
+          else:
+            e10 += (if eneg: -expVal else: expVal)
+        if hasDigits and not expMalformed and (j >= s.len or s[j] in {',', '}', ']', ' ', '\n', '\t', '\r'}):
+          if not isFloatLike and not truncatedNonZero:
+            # Integer value = mant (<=19 digits, exact)
+            if neg:
+              if mant <= uint64(high(BiggestInt)) + 1'u64:
+                i = j
+                if mant <= uint64(high(BiggestInt)):
+                  v = newJInt(-BiggestInt(mant))
+                else:
+                  v = newJInt(low(BiggestInt))
+                return
+            else:
+              if mant <= uint64(high(BiggestInt)):
+                i = j
+                v = newJInt(BiggestInt(mant))
+                return
+            # out of BiggestInt range -> fall through
+          elif isFloatLike and not truncatedNonZero:
+            var outv: float64
+            if mant == 0'u64:
+              outv = if neg: -0.0 else: 0.0
+              i = j
+              v = newJFloat(outv)
+              return
+            # Exact small Clinger
+            if mant <= (1'u64 shl 53) and e10 >= -22 and e10 <= 22:
+              outv = mant.float64
+              if e10 < 0:
+                outv = outv / fastnumMod.pow10f64[-e10]
+              elif e10 > 0:
+                outv = outv * fastnumMod.pow10f64[e10]
+              if neg: outv = -outv
+              i = j
+              v = newJFloat(outv)
+              return
+            # Eisel-Lemire (conservative)
+            when not defined(jsonyNoFastFloat):
+              when defined(amd64) or defined(arm64):
+                if e10 >= eiselMod.eiselSmallest and e10 <= eiselMod.eiselLargest:
+                  if eiselMod.eiselCompute(mant, e10, neg, outv):
+                    i = j
+                    v = newJFloat(outv)
+                    return
+            # fallback: parse float from original span (may re-scan)
+            var f: float64
+            var k = i
+            parseHook(s, k, f)
+            if k == j:
+              i = j
+              v = newJFloat(f)
+              return
+          # truncated/out-of-range ints or ambiguous floats -> fallback below
+        # if not well-formed boundary, fall through to original symbol parse (for error parity)
     var data = parseSymbol(s, i)
     if data == "null":
       v = newJNull()
