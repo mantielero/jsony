@@ -549,6 +549,43 @@ proc parseUnicodeEscape(s: string, i: var int): int =
     if (nextRune and 0xfc00) == 0xdc00:
       result = 0x10000 + (((result - 0xd800) shl 10) or (nextRune - 0xdc00))
 
+when defined(amd64) and not defined(js) and (defined(gcc) or defined(clang) or defined(icc)):
+  {.passC: "-msse2".}
+  type M128i {.importc: "__m128i", header: "<emmintrin.h>".} = object
+  proc mm_loadu_si128(p: pointer): M128i {.importc: "_mm_loadu_si128", header: "<emmintrin.h>".}
+  proc mm_set1_epi8(c: int8): M128i {.importc: "_mm_set1_epi8", header: "<emmintrin.h>".}
+  proc mm_cmpeq_epi8(a, b: M128i): M128i {.importc: "_mm_cmpeq_epi8", header: "<emmintrin.h>".}
+  proc mm_cmplt_epi8(a, b: M128i): M128i {.importc: "_mm_cmplt_epi8", header: "<emmintrin.h>".}
+  proc mm_or_si128(a, b: M128i): M128i {.importc: "_mm_or_si128", header: "<emmintrin.h>".}
+  proc mm_movemask_epi8(a: M128i): cint {.importc: "_mm_movemask_epi8", header: "<emmintrin.h>".}
+
+  template scanPlainAsciiSimd16(s: string, j: var int): bool =
+    ## Returns true if a special char was found; j advanced past plain bytes.
+    ## Special means quote, backslash, control (<0x20) or non-ASCII (high bit),
+    ## which matches the signed compare `byte < 0x20` plus quote/backslash checks.
+    var foundSpecial = false
+    let quote = mm_set1_epi8(34'i8)
+    let backslash = mm_set1_epi8(92'i8)
+    let ctrl = mm_set1_epi8(32'i8) # signed < 32 catches 0..31 and 0x80..0xff
+    while j + 16 <= s.len:
+      let v = mm_loadu_si128(s[j].unsafeAddr)
+      let m = mm_or_si128(
+        mm_or_si128(mm_cmpeq_epi8(v, quote), mm_cmpeq_epi8(v, backslash)),
+        mm_cmplt_epi8(v, ctrl))
+      let mask = mm_movemask_epi8(m)
+      if mask != 0:
+        # Advance to first special byte; trailing-zero count on low 16 bits.
+        var m16 = uint32(mask) and 0xffff'u32
+        var tz = 0
+        while (m16 and 1'u32) == 0'u32:
+          m16 = m16 shr 1
+          inc tz
+        j += tz
+        foundSpecial = true
+        break
+      j += 16
+    foundSpecial
+
 proc parseHook*(s: string, i: var int, v: var string) =
   ## Parse string.
   eatSpace(s, i)
@@ -574,6 +611,9 @@ proc parseHook*(s: string, i: var int, v: var string) =
           break fastNoEscape
         else:
           var j = i
+          when defined(amd64) and (defined(gcc) or defined(clang) or defined(icc)):
+            # SIMD scan: 16 bytes at a time for quote/backslash/control/non-ASCII.
+            discard scanPlainAsciiSimd16(s, j)
           while j < s.len:
             let ch = s[j]
             if ch == '"':
@@ -639,6 +679,11 @@ proc parseHook*(s: string, i: var int, v: var string) =
         inc i
         when not defined(jsonyNoFastStr):
           # Fast skip over plain ASCII run (no quote, no backslash, no high bit).
+          when nimvm:
+            discard
+          else:
+            when defined(amd64) and not defined(js) and (defined(gcc) or defined(clang) or defined(icc)):
+              discard scanPlainAsciiSimd16(s, i)
           while i < s.len:
             let c2 = s[i]
             if c2 == '"' or c2 == '\\' or (cast[uint8](c2) and 0b10000000'u8) != 0:
@@ -755,6 +800,11 @@ proc skipValue*(s: string, i: var int) =
           inc i
           when not defined(jsonyNoFastStr):
             # Fast skip over plain ASCII run.
+            when nimvm:
+              discard
+            else:
+              when defined(amd64) and not defined(js) and (defined(gcc) or defined(clang) or defined(icc)):
+                discard scanPlainAsciiSimd16(s, i)
             while i < s.len:
               let c2 = s[i]
               if c2 == '"' or c2 == '\\' or (cast[uint8](c2) and 0b10000000'u8) != 0:
