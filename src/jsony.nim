@@ -116,9 +116,71 @@ proc parseHook*(s: string, i: var int, v: var bool) =
 
 proc parseHook*(s: string, i: var int, v: var SomeUnsignedInt) =
   ## Will parse unsigned integers.
+  ## Fast path: parse simple decimal integers inline with overflow/range guards.
+  ## Falls back to the original path for ambiguous or out-of-range forms to
+  ## preserve truncation/wrap/error semantics.
   when nimvm:
     v = type(v)(parseInt(parseSymbol(s, i)))
   else:
+    when not defined(jsonyNoFastInt):
+      block fastPath:
+        var j = i
+        let n = s.len
+        # Inline eatSpace (common case: already at digit).
+        while j < n and (s[j] == ' ' or s[j] == '\n' or s[j] == '\t' or s[j] == '\r'):
+          inc j
+        if j >= n or s[j] < '0' or s[j] > '9':
+          break fastPath
+        let startJ = j
+        var acc: uint64 = 0
+        while j < n:
+          let c = s[j]
+          if c < '0' or c > '9':
+            break
+          acc = acc * 10'u64 + uint64(ord(c) - ord('0'))
+          inc j
+        let digits = j - startJ
+        # <=18 digits: no uint64 overflow possible.
+        if digits <= 18:
+          when v is uint64:
+            i = j
+            v = acc
+            return
+          else:
+            if acc <= uint64(high(type(v))):
+              i = j
+              v = type(v)(acc)
+              return
+            # Preserve original truncation/wrap behavior by falling back.
+            break fastPath
+        elif digits == 19:
+          # Recompute with overflow check.
+          acc = 0
+          var k = startJ
+          var overflow = false
+          while k < j:
+            let d = uint64(ord(s[k]) - ord('0'))
+            if acc > (high(uint64) - d) div 10'u64:
+              overflow = true
+              break
+            acc = acc * 10'u64 + d
+            inc k
+          if overflow:
+            break fastPath
+          when v is uint64:
+            i = j
+            v = acc
+            return
+          else:
+            if acc <= uint64(high(type(v))):
+              i = j
+              v = type(v)(acc)
+              return
+            break fastPath
+        else:
+          # >=20 digits: fall back to original (wrap/semantics).
+          break fastPath
+    # Original path.
     eatSpace(s, i)
     var
       v2: uint64 = 0
@@ -132,9 +194,106 @@ proc parseHook*(s: string, i: var int, v: var SomeUnsignedInt) =
 
 proc parseHook*(s: string, i: var int, v: var SomeSignedInt) =
   ## Will parse signed integers.
+  ## Fast path: parse simple decimal integers inline with overflow/range guards.
+  ## Falls back to the original path for ambiguous or out-of-range forms to
+  ## preserve error/Defect semantics (including int64 min boundary behavior).
   when nimvm:
     v = type(v)(parseInt(parseSymbol(s, i)))
   else:
+    when not defined(jsonyNoFastInt):
+      block fastPath:
+        var j = i
+        let n = s.len
+        while j < n and (s[j] == ' ' or s[j] == '\n' or s[j] == '\t' or s[j] == '\r'):
+          inc j
+        var neg = false
+        if j < n:
+          if s[j] == '+':
+            inc j
+          elif s[j] == '-':
+            neg = true
+            inc j
+        let startJ = j
+        if j >= n or s[j] < '0' or s[j] > '9':
+          break fastPath
+        var acc: uint64 = 0
+        while j < n:
+          let c = s[j]
+          if c < '0' or c > '9':
+            break
+          acc = acc * 10'u64 + uint64(ord(c) - ord('0'))
+          inc j
+        let digits = j - startJ
+        # Fast, safe ranges: <=18 digits never overflow uint64.
+        if digits <= 18:
+          when sizeof(type(v)) == 8:
+            if not neg:
+              if acc <= uint64(high(int64)):
+                i = j
+                v = type(v)(int64(acc))
+                return
+            else:
+              # Magnitude <= 10^18 < 2^63.
+              i = j
+              v = -type(v)(int64(acc))
+              return
+          else:
+            let hiU = uint64(high(type(v)))
+            if not neg:
+              if acc <= hiU:
+                i = j
+                v = type(v)(acc)
+                return
+            else:
+              if acc <= hiU:
+                i = j
+                v = -type(v)(acc)
+                return
+          break fastPath
+        elif digits == 19:
+          # Recompute with overflow check (20+ digits fall back to original).
+          acc = 0
+          var k = startJ
+          var overflow = false
+          while k < j:
+            let d = uint64(ord(s[k]) - ord('0'))
+            if acc > (high(uint64) - d) div 10'u64:
+              overflow = true
+              break
+            acc = acc * 10'u64 + d
+            inc k
+          if overflow:
+            break fastPath
+          when sizeof(type(v)) == 8:
+            if not neg:
+              if acc <= uint64(high(int64)):
+                i = j
+                v = type(v)(int64(acc))
+                return
+            else:
+              # Magnitude 2^63 would be RangeDefect in original -> fall back.
+              if acc <= uint64(high(int64)):
+                i = j
+                v = -type(v)(int64(acc))
+                return
+            break fastPath
+          else:
+            let hiU = uint64(high(type(v)))
+            if not neg:
+              if acc <= hiU:
+                i = j
+                v = type(v)(acc)
+                return
+            else:
+              if acc <= hiU:
+                i = j
+                v = -type(v)(acc)
+                return
+            break fastPath
+        else:
+          # >=20 digits: let original handle (overflow/range/error semantics).
+          break fastPath
+    # Original path.
     eatSpace(s, i)
     if i < s.len and s[i] == '+':
       inc i
