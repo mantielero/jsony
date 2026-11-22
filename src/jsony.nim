@@ -34,11 +34,27 @@ template error(msg: string, i: int) =
 
 template eatSpace*(s: string, i: var int) =
   ## Will consume whitespace.
+  ## Fast path: skip 8 consecutive spaces at once when the input is aligned
+  ## for a safe 8-byte load. Falls back to byte-by-byte scanning for other
+  ## whitespace, non-ASCII, or platforms where the word load is unsafe.
   while i < s.len:
     let c = s[i]
-    if c notin whiteSpace:
+    if c == ' ':
+      when nimvm:
+        inc i
+      else:
+        when not defined(js):
+          if i + 8 <= s.len:
+            var w: uint64
+            copyMem(w.addr, s[i].unsafeAddr, 8)
+            if w == 0x2020202020202020'u64:
+              i += 8
+              continue
+        inc i
+    elif c == '\n' or c == '\t' or c == '\r':
+      inc i
+    else:
       break
-    inc i
 
 template eatChar*(s: string, i: var int, c: char) =
   ## Will consume space before and then the character `c`.
