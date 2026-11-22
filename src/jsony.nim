@@ -562,6 +562,35 @@ proc parseHook*(s: string, i: var int, v: var string) =
 
   eatChar(s, i, '"')
 
+  when not defined(jsonyNoFastStr):
+    when defined(js):
+      discard
+    else:
+      # Fast path: plain ASCII string without escapes/control chars.
+      # Scan and copy in one go, falling back on escapes, control chars, or
+      # non-ASCII bytes to preserve validation/error behavior.
+      block fastNoEscape:
+        when nimvm:
+          break fastNoEscape
+        else:
+          var j = i
+          while j < s.len:
+            let ch = s[j]
+            if ch == '"':
+              let numBytes = j - i
+              if numBytes > 0:
+                let vLen = v.len
+                v.setLen(vLen + numBytes)
+                copyMem(v[vLen].addr, s[i].unsafeAddr, numBytes)
+              i = j
+              eatChar(s, i, '"')
+              return
+            let b = cast[uint8](ch)
+            if ch == '\\' or b < 0x20'u8 or b >= 0x80'u8:
+              break fastNoEscape
+            inc j
+          # End reached without closing quote -> fall through to original for error.
+
   template doCopy() =
     if i > copyStart:
       let numBytes = i - copyStart
@@ -582,7 +611,7 @@ proc parseHook*(s: string, i: var int, v: var string) =
   while i < s.len:
     let c = s[i]
     if (cast[uint8](c) and 0b10000000) == 0:
-      # When the high bit is not set this is a single-byte character (ASCII)
+      # When the high bit is not set this is a single-byte character (ASCII).
       case c
       of '"':
         break
@@ -592,9 +621,9 @@ proc parseHook*(s: string, i: var int, v: var string) =
         doCopy()
         inc i
         copyStart = i
-        let c = s[i]
-        case c
-        of '"', '\\', '/': v.add(c)
+        let ec = s[i]
+        case ec
+        of '"', '\\', '/': v.add(ec)
         of 'b': v.add '\b'
         of 'f': v.add '\f'
         of 'n': v.add '\n'
@@ -603,11 +632,18 @@ proc parseHook*(s: string, i: var int, v: var string) =
         of 'u':
           v.add(Rune(parseUnicodeEscape(s, i)))
         else:
-          v.add(c)
+          v.add(ec)
         inc i
         copyStart = i
       else:
         inc i
+        when not defined(jsonyNoFastStr):
+          # Fast skip over plain ASCII run (no quote, no backslash, no high bit).
+          while i < s.len:
+            let c2 = s[i]
+            if c2 == '"' or c2 == '\\' or (cast[uint8](c2) and 0b10000000'u8) != 0:
+              break
+            inc i
     else: # Multi-byte characters
       let r = s.validRuneAt(i)
       if r.isSome:
@@ -694,10 +730,69 @@ proc skipValue*(s: string, i: var int) =
         inc i
     eatChar(s, i, ']')
   elif i < s.len and s[i] == '"':
-    var str: string
-    parseHook(s, i, str)
+    # Skip string without allocating result, but with same validation/errors.
+    eatChar(s, i, '"')
+    while i < s.len:
+      let c = s[i]
+      if (cast[uint8](c) and 0b10000000) == 0:
+        case c
+        of '"':
+          break
+        of '\\':
+          if i + 1 >= s.len:
+            error("Expected escaped character but end reached.", i)
+          inc i
+          let ec = s[i]
+          case ec
+          of '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+            discard
+          of 'u':
+            discard parseUnicodeEscape(s, i)
+          else:
+            discard
+          inc i
+        else:
+          inc i
+          when not defined(jsonyNoFastStr):
+            # Fast skip over plain ASCII run.
+            while i < s.len:
+              let c2 = s[i]
+              if c2 == '"' or c2 == '\\' or (cast[uint8](c2) and 0b10000000'u8) != 0:
+                break
+              inc i
+      else:
+        let r = s.validRuneAt(i)
+        if r.isSome:
+          i += r.unsafeGet.size
+        else:
+          error("Found invalid UTF-8 character.", i)
+    eatChar(s, i, '"')
   else:
-    discard parseSymbol(s, i)
+    # Literals/numbers/symbols: advance like parseSymbol but without allocation.
+    # Fast boundary-checked path for common JSON literals.
+    if i < s.len:
+      let c = s[i]
+      if c == 'n' and i + 3 < s.len and s[i+1] == 'u' and s[i+2] == 'l' and s[i+3] == 'l':
+        let j = i + 4
+        if j >= s.len or s[j] in {',', '}', ']', ' ', '\n', '\t', '\r'}:
+          i = j
+          return
+      elif c == 't' and i + 3 < s.len and s[i+1] == 'r' and s[i+2] == 'u' and s[i+3] == 'e':
+        let j = i + 4
+        if j >= s.len or s[j] in {',', '}', ']', ' ', '\n', '\t', '\r'}:
+          i = j
+          return
+      elif c == 'f' and i + 4 < s.len and s[i+1] == 'a' and s[i+2] == 'l' and s[i+3] == 's' and s[i+4] == 'e':
+        let j = i + 5
+        if j >= s.len or s[j] in {',', '}', ']', ' ', '\n', '\t', '\r'}:
+          i = j
+          return
+    while i < s.len:
+      case s[i]
+      of ',', '}', ']', ' ', '\n', '\t', '\r':
+        break
+      else:
+        inc i
 
 proc snakeCaseDynamic(s: string): string =
   if s.len == 0:
