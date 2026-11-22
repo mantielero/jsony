@@ -390,28 +390,220 @@ template snakeCase(s: string): string =
   k
 
 proc parseObjectInner[T](s: string, i: var int, v: var T) =
-  while i < s.len:
-    eatSpace(s, i)
-    if i < s.len and s[i] == '}':
-      break
-    var key: string
-    parseHook(s, i, key)
-    eatChar(s, i, ':')
-    when compiles(renameHook(v, key)):
-      renameHook(v, key)
-    block all:
-      for k, v in v.fieldPairs:
-        if k == key or snakeCase(k) == key:
-          var v2: type(v)
-          parseHook(s, i, v2)
-          v = v2
-          break all
-      skipValue(s, i)
-    eatSpace(s, i)
-    if i < s.len and s[i] == ',':
-      inc i
-    else:
-      break
+  ## Parse object members into an existing object/tuple-like value.
+  ## Fast path: for plain ASCII keys without escapes/control chars, scan the key
+  ## slice directly and dispatch by uint64 word compare for short keys (<=8 bytes),
+  ## avoiding key string allocation. Falls back to the original key parsing path
+  ## for escaped keys, renameHook users, or unsupported key shapes.
+  block objLoop:
+    while i < s.len:
+      eatSpace(s, i)
+      if i < s.len and s[i] == '}':
+        break
+      block keyParsed:
+        when not defined(jsonyNoFastKey):
+          # Fast path: plain ASCII key without escapes/control chars.
+          block fastKey:
+            var j = i
+            if j >= s.len or s[j] != '"':
+              break fastKey
+            inc j
+            let keyStart = j
+            while j < s.len:
+              let ch = s[j]
+              if ch == '"':
+                var kidx = j + 1
+                while kidx < s.len and (s[kidx] == ' ' or s[kidx] == '\n' or s[kidx] == '\t' or s[kidx] == '\r'):
+                  inc kidx
+                if kidx >= s.len or s[kidx] != ':':
+                  break fastKey
+                inc kidx
+                i = kidx
+                let keyLen = j - keyStart
+                when compiles(block:
+                  var tmpKey = ""
+                  renameHook(v, tmpKey)):
+                  # renameHook can rewrite keys arbitrarily; keep original semantics.
+                  var key = s[keyStart ..< j]
+                  renameHook(v, key)
+                  block all:
+                    for k, vf in v.fieldPairs:
+                      if k == key:
+                        var v2: type(vf)
+                        parseHook(s, i, v2)
+                        vf = v2
+                        break all
+                      const sk = snakeCase(k)
+                      when sk != k:
+                        if sk == key:
+                          var v2: type(vf)
+                          parseHook(s, i, v2)
+                          vf = v2
+                          break all
+                    skipValue(s, i)
+                else:
+                  block all:
+                    when defined(js):
+                      for k, vf in v.fieldPairs:
+                        if k.len == keyLen:
+                          block tryK:
+                            var p = 0
+                            while p < keyLen:
+                              if k[p] != s[keyStart + p]:
+                                break tryK
+                              inc p
+                            var v2: type(vf)
+                            parseHook(s, i, v2)
+                            vf = v2
+                            break all
+                        const sk = snakeCase(k)
+                        when sk != k:
+                          if sk.len == keyLen:
+                            block trySk:
+                              var p = 0
+                              while p < keyLen:
+                                if sk[p] != s[keyStart + p]:
+                                  break trySk
+                                inc p
+                              var v2: type(vf)
+                              parseHook(s, i, v2)
+                              vf = v2
+                              break all
+                    else:
+                      # uint64 word dispatch for short keys (<=8 bytes), little-endian compare.
+                      var keyWord: uint64 = 0
+                      let keyHasWord = keyLen <= 8 and keyStart + 8 <= s.len
+                      if keyHasWord:
+                        copyMem(keyWord.addr, s[keyStart].unsafeAddr, 8)
+                      for k, vf in v.fieldPairs:
+                        when k.len == 0:
+                          if keyLen == 0:
+                            var v2: type(vf)
+                            parseHook(s, i, v2)
+                            vf = v2
+                            break all
+                        elif k.len <= 8:
+                          if k.len == keyLen:
+                            if keyHasWord:
+                              const kw = block:
+                                var x: uint64 = 0
+                                for ci in 0..<k.len:
+                                  x = x or (uint64(uint8(ord(k[ci]))) shl (ci * 8))
+                                x
+                              const km = block:
+                                var x: uint64 = 0
+                                for ci in 0..<k.len:
+                                  x = x or (uint64(0xff) shl (ci * 8))
+                                x
+                              if (keyWord and km) == kw:
+                                var v2: type(vf)
+                                parseHook(s, i, v2)
+                                vf = v2
+                                break all
+                            else:
+                              block tryK:
+                                var p = 0
+                                while p < keyLen:
+                                  if k[p] != s[keyStart + p]:
+                                    break tryK
+                                  inc p
+                                var v2: type(vf)
+                                parseHook(s, i, v2)
+                                vf = v2
+                                break all
+                        else:
+                          if k.len == keyLen:
+                            block tryK:
+                              var p = 0
+                              while p < keyLen:
+                                if k[p] != s[keyStart + p]:
+                                  break tryK
+                                inc p
+                              var v2: type(vf)
+                              parseHook(s, i, v2)
+                              vf = v2
+                              break all
+                        const sk = snakeCase(k)
+                        when sk != k:
+                          when sk.len <= 8:
+                            if sk.len == keyLen:
+                              if keyHasWord:
+                                const skw = block:
+                                  var x: uint64 = 0
+                                  for ci in 0..<sk.len:
+                                    x = x or (uint64(uint8(ord(sk[ci]))) shl (ci * 8))
+                                  x
+                                const skm = block:
+                                  var x: uint64 = 0
+                                  for ci in 0..<sk.len:
+                                    x = x or (uint64(0xff) shl (ci * 8))
+                                  x
+                                if (keyWord and skm) == skw:
+                                  var v2: type(vf)
+                                  parseHook(s, i, v2)
+                                  vf = v2
+                                  break all
+                              else:
+                                block trySk:
+                                  var p = 0
+                                  while p < keyLen:
+                                    if sk[p] != s[keyStart + p]:
+                                      break trySk
+                                    inc p
+                                  var v2: type(vf)
+                                  parseHook(s, i, v2)
+                                  vf = v2
+                                  break all
+                          else:
+                            if sk.len == keyLen:
+                              block trySk:
+                                var p = 0
+                                while p < keyLen:
+                                  if sk[p] != s[keyStart + p]:
+                                    break trySk
+                                  inc p
+                                var v2: type(vf)
+                                parseHook(s, i, v2)
+                                vf = v2
+                                break all
+                    skipValue(s, i)
+                eatSpace(s, i)
+                if i < s.len and s[i] == ',':
+                  inc i
+                else:
+                  break objLoop
+                break keyParsed
+              let b = cast[uint8](ch)
+              if ch == '\\' or b < 0x20'u8 or b >= 0x80'u8:
+                break fastKey
+              inc j
+            # No closing quote or not a plain ASCII key: fall back.
+        var key: string
+        parseHook(s, i, key)
+        eatChar(s, i, ':')
+        when compiles(renameHook(v, key)):
+          renameHook(v, key)
+        block all:
+          for k, vf in v.fieldPairs:
+            if k == key:
+              var v2: type(vf)
+              parseHook(s, i, v2)
+              vf = v2
+              break all
+            const sk = snakeCase(k)
+            when sk != k:
+              if sk == key:
+                var v2: type(vf)
+                parseHook(s, i, v2)
+                vf = v2
+                break all
+          skipValue(s, i)
+        eatSpace(s, i)
+        if i < s.len and s[i] == ',':
+          inc i
+        else:
+          break objLoop
+      # Continue while-loop when fast key consumed comma/ended object.
   when compiles(postHook(v)):
     postHook(v)
 
